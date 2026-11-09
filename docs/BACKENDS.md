@@ -25,6 +25,7 @@ a second machine, a Windows laptop whose card has 8 GB.
 | Flint 40B-A2.5B | `flint` | `strata-poly` | Unsloth UD-Q4_K_XL, UD-Q3_K_XL, UD-Q6_K_XL and Q8_0, 18.5 to 42.3 GB | repeats only: there is no draft model |
 | Kolibri 1 | `kolibri1` | `strata-poly` | Hob-forge Q4_K_M, Q2_K and Q3_K_M, 28.6 to 47.5 GB | repeats only: there is no draft model |
 | Clover-35B-A3B-Preview | `clover_moe` | `strata-poly` | maternion Q3_K_M and Q4_K_M, IsValorum APEX-I-NanoPlus, 12.6 to 21.2 GB | repeats only: its own block guesses are off ([below](#clover-35b-a3b-preview)) |
+| Nemotron 3.5 Bolt 74B-A9B | `nemotron_h_moe` | `strata-poly` | the official IQ2_XXS + NVFP4 pack, 22.02 GB | none: it answers one token at a time ([NEMOTRON.md](NEMOTRON.md)) |
 
 `strata` is the first engine and runs Qwen3.8 only; nothing in it changed. `strata-poly` is the engine that reads a
 GGUF in place, and it now has eight architectures. It was called `strata-glm`, after its first model; an install
