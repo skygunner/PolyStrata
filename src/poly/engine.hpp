@@ -142,9 +142,13 @@ struct Layer {
     bool mmq = false;     ///< the card has MMQ tiles for its routed experts' types (Engine::batched())
     bool fixed = false;   ///< one token's launches can be recorded and replayed for the next ones (eval()): they
                           ///< are the same for every token, or read the position on the card (Engine::at_)
+    bool relu2 = false;   ///< one up projection, relu(x)^2, not a GLU pair (Nemotron-H)
     Dev attn_norm, ffn_norm;   ///< the norms ahead of the attention and of the FFN
-    // MoE
+    // MoE.  expert_* is this layer's geometry.  load_moe() sets the uniform models to the file-wide counts, so a
+    // loop over expert_count is the old loop over n_expert_.  A Nemotron layer can have fewer experts and a
+    // different FFN than the file-wide max; tables stay strided by that max.
     Dev gate_inp, sh_gate, sh_up, sh_down;
+    int expert_count = 0, expert_used = 0, expert_ff = 0, expert_in = 0, expert_out = 0;
     const uint8_t* exp_gate = nullptr;  ///< n_expert experts back to back, in the mapped file
     const uint8_t* exp_up = nullptr;
     const uint8_t* exp_down = nullptr;
@@ -337,7 +341,7 @@ public:
     /// them), and those experts' GiB.
     int64_t ram_experts_mib() const { return opt_.ram_experts_mib; }
     double outside_gib() const { return double(outside_bytes_) / double(1ull << 30); }
-    int total_experts() const { return n_moe_ * n_expert_ + (next_ ? next_->total_experts() : 0); }
+    int total_experts() const { return card_experts() + (next_ ? next_->total_experts() : 0); }
     double cached_gib() const { return double(exp_at_) / double(1ull << 30) + (next_ ? next_->cached_gib() : 0); }
     /// The cache as load() filled it, which is as large as resize_cache() makes it again.
     int full_experts() const { return full_cached_ + (next_ ? next_->full_experts() : 0); }
@@ -490,7 +494,13 @@ protected:
     bool runs(int il) const { return il >= lo_ && (il < hi_ || hi_ == n_layer_); }
     size_t card_state_bytes() const { return state_n_ * sizeof(float) + extra_bytes(); }
     /// Every expert of this engine's layers is in its cache.
-    bool all_cached() const { return cached_ == n_moe_ * n_expert_; }
+    int card_experts() const {
+        int n = 0;
+        for (const Layer& l : layers_)
+            if (l.moe) n += l.expert_count;
+        return n;
+    }
+    bool all_cached() const { return cached_ == card_experts(); }
     /// The rows a call of n tokens leaves in r_, to h (pinned) for the next card's engine, which goes on from them.
     void hand_on(int64_t pos, int n, float* h);
     float* pass_rows(int n);
@@ -535,7 +545,7 @@ protected:
     /// The routed experts' rows a call routed on the card has room for (d_): a window of a model that guesses its
     /// own block, or kSumRows.  The others keep kSumRows, whose windows past it are routed on the host as before.
     int card_rows() const;
-    void moe_add(int n);
+    void moe_add(const Layer& L, int n);
     template <class F>
     void* record(F&& work);
     void moe_rows(Layer& L, int il, int n);

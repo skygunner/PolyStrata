@@ -69,8 +69,10 @@ bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::str
 /// u_type is up's type: gate's in every file but the few that quantize the two apart.
 /// `late`, when given, marks the experts whose weights are still being read: their products come after the others',
 /// and `wait(j)` is called before experts[j]'s are read.  The sums are as without them.
+/// n_embd is the input width.  n_out is the down projection's rows (n_embd for a GLU expert).
+/// relu2 skips the up dot: the hidden row is relu(gate x)^2.  up may alias gate.
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int u_type, int d_type,
-                 int n_embd, int n_ff, const float* x, float limit, bool gelu, float* out,
+                 int n_embd, int n_ff, const float* x, float limit, bool gelu, int n_out, bool relu2, float* out,
                  const std::function<void()>* meanwhile = nullptr, const uint8_t* late = nullptr,
                  const std::function<void(int)>* wait = nullptr);
 

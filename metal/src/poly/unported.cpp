@@ -57,6 +57,13 @@ void dequant_int8_to_f16(const int8_t*, const uint16_t*, uint16_t*, int64_t, voi
 void conv4_block_silu(const float*, const float*, const float*, const float*, float*, int, int, void*) {
     unported("block guesses (Clover)");
 }
+// Nemotron-H is not a Metal family: the factory refuses it.  These are here so the shared engine still
+// links, and a call that reached one says what is missing instead of computing something else.
+void relu2_rows(const float*, float*, int, int, void*) { unported("ReLU-squared experts (Nemotron-H)"); }
+void mamba2_step(const float*, const float*, const float*, const float*, const float*, const float*, const float*,
+                 const float*, float*, float*, int, int, int, int, int, float, void*) {
+    unported("Mamba-2 (Nemotron-H)");
+}
 void gdn_block(float*, float*, float*, const float*, const float*, const float*, const float*, const float*,
                const float*, const float*, const float*, float*, float*, int, int, int, int, float, void*) {
     unported("block guesses (Clover)");

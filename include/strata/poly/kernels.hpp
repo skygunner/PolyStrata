@@ -178,6 +178,14 @@ void swiglu_clamp_rows(const float* gate_up, float* out, int n, int rows, float 
 void geglu(const float* gate, const float* up, float* out, int n, void* stream);
 /// geglu for rows that each hold n gate values and then n up values; out has n values a row.
 void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream);
+/// out = relu(x)^2, row by row.  Nemotron-H experts have one up projection, not a GLU pair.
+void relu2_rows(const float* x, float* out, int n, int rows, void* stream);
+/// One Mamba-2 selective scan, then its z gate and grouped RMS norm.  state is [inner, state_dim]
+/// (state_dim is 128).  B and C are [rows, groups, state_dim].  Rows run in order, so the state left
+/// is the state after the last row.  norm has inner values.
+void mamba2_step(const float* x, const float* dt, const float* a, const float* b, const float* c,
+                 const float* d, const float* z, const float* norm, float* state, float* out,
+                 int inner, int heads, int groups, int state_dim, int rows, float eps, void* stream);
 /// The routing of `rows` tokens from their router scores (n_expert a token, times in_scale), as an architecture's
 /// route() does it on the host: probabilities by `gate` (0 softmax, 1 sigmoid, 2 sqrt(softplus), 3 sigmoid with the
 /// pick on the bare scores), the n_used largest of the probabilities plus `bias` (null: none), the lower expert
@@ -315,8 +323,9 @@ void mul_sigmoid(float* acc, const float* g, int n, int rows, int g_stride, bool
 /// With snap, the state as it is after some of the call's tokens is also written there, for a window of guessed
 /// tokens to go back to (gdn_step too): `snaps` has a bit for each token that leaves it, and the states lie in
 /// the tokens' order, `stride` floats apart.
+/// `bias`, when set, is one float per channel added before the SiLU.  Null is the no-bias sum.
 void conv4_silu(const float* x, float* state, const float* w, float* out, int channels, int rows, void* stream,
-                float* snap = nullptr, size_t stride = 0, unsigned snaps = 0);
+                float* snap = nullptr, size_t stride = 0, unsigned snaps = 0, const float* bias = nullptr);
 /// LFM2's gated short convolution (llama.cpp's shortconv block between its two projections).  bcx: B, C and x of a
 /// token, `channels` values each, as the in_proj writes them.  out = C * conv3(B * x), `channels` values a token,
 /// a causal convolution of three taps w (3, channels).  state: the 2 B * x before the call a channel, oldest

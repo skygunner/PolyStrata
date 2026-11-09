@@ -343,10 +343,13 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        // Per-layer geometry can be longer than 64 (Nemotron-H has 88).  Keep those whole.  Tokenizer
+        // arrays are still a sample: 1024 strings, not the whole vocabulary.
+        constexpr uint64_t kKeptArrayItems = 1024;
+        v.items.reserve((size_t)std::min<uint64_t>(v.count, kKeptArrayItems));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            if (i < kKeptArrayItems) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
         }
         break;
     }

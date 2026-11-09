@@ -10,6 +10,7 @@
 #include <immintrin.h>
 #include <mutex>
 #include <numeric>
+#include <utility>
 
 namespace strata::poly {
 namespace {
@@ -123,14 +124,15 @@ void Workers::run(int n, const std::function<void(int)>& fn) {
 
 bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::string& err) {
     init_once();
-    for (const int type : {gu_type, d_type}) {
+    // each type with its own width: gate and down are the same type in the official pack, and then both
+    // widths must still be whole blocks of it
+    for (const auto& [type, n] : {std::pair{gu_type, n_embd}, std::pair{d_type, n_ff}}) {
         const ggml_type_traits_cpu* t = traits(type);
         const ggml_type_traits_cpu* a = t && t->vec_dot ? traits(t->vec_dot_type) : nullptr;
         if (a == nullptr || a->from_float == nullptr) {
             err = "ggml-cpu has no dot product for tensor type " + std::to_string(type);
             return false;
         }
-        const int n = type == gu_type ? n_embd : n_ff;
         if (n % ggml_blck_size((ggml_type) type) || n % ggml_blck_size(t->vec_dot_type)) {
             err = "a row of " + std::to_string(n) + " values is not whole blocks of tensor type " + std::to_string(type);
             return false;
@@ -140,7 +142,7 @@ bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::str
 }
 
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int u_type, int d_type,
-                 int n_embd, int n_ff, const float* x, float limit, bool gelu, float* out,
+                 int n_embd, int n_ff, const float* x, float limit, bool gelu, int n_out, bool relu2, float* out,
                  const std::function<void()>* meanwhile, const uint8_t* late, const std::function<void(int)>* wait) {
     init_once();
     const ggml_type_traits_cpu* tg = traits(gu_type);
@@ -213,6 +215,11 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                 const uint8_t* au = actup + (size_t) experts[j].row * au_step;
                 float g = 0.f, u = 0.f;
                 tg->vec_dot(n_embd, &g, 0, gate, 0, a, 0, 1);
+                if (relu2) {
+                    const float r2 = g > 0.f ? g : 0.f;
+                    hp[(size_t) j * n_ff + r] = r2 * r2;
+                    continue;
+                }
                 tu->vec_dot(n_embd, &u, 0, up, 0, au, 0, 1);
                 if (gelu) {
                     hp[(size_t) j * n_ff + r] =
@@ -229,12 +236,12 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     const auto hq_from = traits(td->vec_dot_type)->from_float;
     workers.run(n, [&](int j) { hq_from(hp + (size_t) j * n_ff, hqp + (size_t) j * h_bytes, n_ff); });
 
-    const int d_tasks = (n_embd + kRowsPerDownTask - 1) / kRowsPerDownTask;
+    const int d_tasks = (n_out + kRowsPerDownTask - 1) / kRowsPerDownTask;
     workers.run(d_tasks, [&](int t) {
         static thread_local std::vector<float> one;   // an output value of every use
         one.resize((size_t) n);
         float* s = one.data();
-        const int r0 = t * kRowsPerDownTask, r1 = std::min(n_embd, r0 + kRowsPerDownTask);
+        const int r0 = t * kRowsPerDownTask, r1 = std::min(n_out, r0 + kRowsPerDownTask);
         for (int r = r0; r < r1; ++r) {
             for (int u = 0; u < n_run; ++u) {
                 const uint8_t* down = experts[byp[runp[u]]].down + (size_t) r * d_row;
@@ -246,7 +253,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             for (int row = 0; row < rows; ++row) {
                 float acc = 0.f;
                 for (; j < n && experts[j].row == row; ++j) acc += experts[j].weight * s[j];
-                out[(size_t) row * n_embd + r] = acc;
+                out[(size_t) row * n_out + r] = acc;
             }
         }
     });

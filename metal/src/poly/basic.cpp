@@ -113,7 +113,8 @@ void shortconv(const float* x, float* state, const float* w, float* out, int cha
     convolution(x,state,w,out,channels,rows,stream,snap,stride,snaps,0);
 }
 void conv4_silu(const float* x, float* state, const float* w, float* out, int channels, int rows,
-               void* stream, float* snap, size_t stride, unsigned snaps) {
+               void* stream, float* snap, size_t stride, unsigned snaps, const float* bias) {
+    if (bias) throw std::invalid_argument("conv4 bias is CUDA-only; Metal has no Nemotron conv bias");
     convolution(x,state,w,out,channels,rows,stream,snap,stride,snaps,1);
 }
 void route_rows(const float* logits, int experts, int used, int rows, int gate, float in_scale,

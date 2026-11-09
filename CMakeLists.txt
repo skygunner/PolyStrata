@@ -2095,8 +2095,8 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     # Optional model/state check; run by hand with an MTP GGUF and frozen prompt IDs.
     add_executable(poly_gdn_mma_state_test src/poly/gdn_mma_state_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                    src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp
-                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
-                   src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
+                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/nemotronh.cpp src/poly/cpu_experts.cpp
+                   src/poly/kernels.cu src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
     target_include_directories(poly_gdn_mma_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(poly_gdn_mma_state_test PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base
                          ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} CUDA::cuda_driver Threads::Threads)
@@ -2104,8 +2104,8 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
 
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
-                            src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
-                            src/poly/spill.cpp src/core/conversation_memory.cpp)
+                            src/poly/kolibri1.cpp src/poly/nemotronh.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
+                            src/poly/kernels_dsv4.cu src/poly/spill.cpp src/core/conversation_memory.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
   # memory management calls, which the HIP runtime itself provides (hip_compat/cuda.h)
@@ -2130,8 +2130,8 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(poly_draft_race_test src/poly/draft_race_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                                       src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
                                       src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp
-                                      src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
-                                      src/core/conversation_memory.cpp)
+                                      src/poly/nemotronh.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
+                                      src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
   target_include_directories(poly_draft_race_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                          ${_strata_gpu_include_directories})
   target_link_libraries(poly_draft_race_test PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base
@@ -2204,6 +2204,26 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   target_include_directories(poly_shortconv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                         ${_strata_gpu_include_directories})
   target_link_libraries(poly_shortconv_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  # Nemotron-H's ReLU-squared expert activation against the host expression; needs a card, run by hand
+  add_executable(poly_relu2_test src/poly/relu2_test.cu src/poly/kernels.cu)
+  target_include_directories(poly_relu2_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                    ${_strata_gpu_include_directories})
+  target_link_libraries(poly_relu2_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  # Nemotron-H's Mamba-2 recurrence and grouped norm against the host; needs a card, run by hand
+  add_executable(poly_mamba2_test src/poly/mamba2_test.cu src/poly/kernels.cu)
+  target_include_directories(poly_mamba2_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                     ${_strata_gpu_include_directories})
+  target_link_libraries(poly_mamba2_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  # conv4_silu with and without a bias against the host; needs a card, run by hand
+  add_executable(poly_conv4_bias_test src/poly/conv4_bias_test.cu src/poly/kernels.cu)
+  target_include_directories(poly_conv4_bias_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                         ${_strata_gpu_include_directories})
+  target_link_libraries(poly_conv4_bias_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  # Nemotron's projection + F32 result scale on the card; needs a card, run by hand
+  add_executable(poly_nemotron_scale_test src/poly/nemotron_scale_test.cu src/poly/kernels.cu)
+  target_include_directories(poly_nemotron_scale_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                             ${_strata_gpu_include_directories})
+  target_link_libraries(poly_nemotron_scale_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # DeepSeek V4's kernels against the same arithmetic on the host; needs a card, so it is run by hand
   add_executable(poly_dsv4_test src/poly/dsv4_test.cu src/poly/kernels_dsv4.cu)
   target_include_directories(poly_dsv4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -2214,6 +2234,12 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   target_include_directories(poly_workers_test PRIVATE ${_strata_gg}/include)
   target_link_libraries(poly_workers_test PRIVATE ggml-cpu ggml-base Threads::Threads)
   add_test(NAME poly_workers_test COMMAND poly_workers_test)
+  # Nemotron-H's CPU expert path: relu2 with one up matrix and a down projection narrower than the token
+  add_executable(poly_cpu_experts_relu2_test src/poly/cpu_experts_relu2_test.cpp src/poly/cpu_experts.cpp)
+  target_include_directories(poly_cpu_experts_relu2_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/poly
+                                                               ${_strata_gg}/include)
+  target_link_libraries(poly_cpu_experts_relu2_test PRIVATE ggml-cpu ggml-base Threads::Threads)
+  add_test(NAME poly_cpu_experts_relu2_test COMMAND poly_cpu_experts_relu2_test)
   # the card's MXFP4 product against ggml's dequantizer on random blocks, without a model; needs a card, run by hand
   add_executable(poly_mxfp4_test src/poly/mxfp4_test.cu)
   target_include_directories(poly_mxfp4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gg}/include
@@ -2243,6 +2269,19 @@ endif()
 
 if(STRATA_BUILD_TESTS)
   enable_testing()
+  # Nemotron-H's router and metadata checks on the host: no card, no model, no CUDA.
+  add_executable(poly_nemotron_route_test src/poly/nemotron_route_test.cpp)
+  target_include_directories(poly_nemotron_route_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/poly)
+  add_test(NAME poly_nemotron_route_test COMMAND poly_nemotron_route_test)
+  # Malformed per-layer metadata must fail with a message, not allocate or divide by zero.
+  add_executable(poly_nemotron_meta_test src/poly/nemotron_meta_test.cpp)
+  target_include_directories(poly_nemotron_meta_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                             ${CMAKE_CURRENT_SOURCE_DIR}/src/poly)
+  add_test(NAME poly_nemotron_meta_test COMMAND poly_nemotron_meta_test)
+  # GGUF metadata arrays: 88-layer geometry kept, very long lists still sampled
+  add_executable(poly_gguf_array_test src/poly/gguf_array_test.cpp)
+  target_include_directories(poly_gguf_array_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME poly_gguf_array_test COMMAND poly_gguf_array_test)
   # Model-level checks may be absent from source distributions.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)

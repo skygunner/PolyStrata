@@ -994,6 +994,77 @@ __global__ void geglu_rows_kernel(const float* __restrict__ gate_up, float* __re
     out[size_t(blockIdx.y) * n + i] = gelu(row[i]) * row[n + i];
 }
 
+__global__ void relu2_rows_kernel(const float* __restrict__ x, float* __restrict__ out, int n) {
+    const int i = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = (int) blockIdx.y;
+    if (i >= n) return;
+    const float v = x[(size_t) row * n + i];
+    const float r = v > 0.f ? v : 0.f;
+    out[(size_t) row * n + i] = r * r;
+}
+
+// state_dim is 128: one block owns an inner channel and reduces that state in index order.  Rows walk in
+// sequence so a prompt leaves the same state as one token at a time.
+__global__ void mamba2_scan_kernel(const float* __restrict__ x, const float* __restrict__ dt,
+                                   const float* __restrict__ a, const float* __restrict__ b,
+                                   const float* __restrict__ c, const float* __restrict__ d,
+                                   const float* __restrict__ z, float* __restrict__ state,
+                                   float* __restrict__ y, int inner, int heads, int groups,
+                                   int state_dim, int rows) {
+    const int ch = (int) blockIdx.x;
+    const int s = (int) threadIdx.x;
+    const int head = ch / (inner / heads);
+    const int group = head / (heads / groups);
+    __shared__ float sum[128];
+    float st = s < state_dim ? state[(size_t) ch * state_dim + s] : 0.f;
+    for (int row = 0; row < rows; ++row) {
+        const float raw_dt = dt[(size_t) row * heads + head];
+        const float delta = raw_dt > 20.f ? raw_dt : log1pf(expf(raw_dt));
+        const float decay = expf(delta * a[head]);
+        const float xv = x[(size_t) row * inner + ch];
+        if (s < state_dim) {
+            const size_t bc = ((size_t) row * groups + group) * state_dim + s;
+            st = st * decay + b[bc] * (xv * delta);
+            sum[s] = st * c[bc];
+        } else {
+            sum[s] = 0.f;
+        }
+        __syncthreads();
+        for (int step = 64; step > 0; step >>= 1) {
+            if (s < step) sum[s] += sum[s + step];
+            __syncthreads();
+        }
+        if (s == 0) {
+            const float zv = z[(size_t) row * inner + ch];
+            y[(size_t) row * inner + ch] = (sum[0] + xv * d[head]) * (zv / (1.f + expf(-zv)));
+        }
+        __syncthreads();
+    }
+    if (s < state_dim) state[(size_t) ch * state_dim + s] = st;
+}
+
+__global__ void mamba2_group_norm_kernel(float* __restrict__ y, const float* __restrict__ norm,
+                                         int width, int groups, float eps) {
+    const int rg = (int) blockIdx.x;
+    const int row_group = rg * width;
+    float ss = 0.f;
+    for (int i = (int) threadIdx.x; i < width; i += (int) blockDim.x) {
+        const float v = y[row_group + i];
+        ss += v * v;
+    }
+    __shared__ float sums[256];
+    sums[threadIdx.x] = ss;
+    __syncthreads();
+    for (int step = 128; step > 0; step >>= 1) {
+        if (threadIdx.x < step) sums[threadIdx.x] += sums[threadIdx.x + step];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(sums[0] / width + eps);
+    const int group = rg % groups;
+    for (int i = (int) threadIdx.x; i < width; i += (int) blockDim.x)
+        y[row_group + i] *= scale * norm[(size_t) group * width + i];
+}
+
 // A warp a token, a lane every 32nd expert.  The pick is the host's: the n_used largest of the probabilities plus
 // the bias, the lower expert first among equals, one after the other.
 constexpr int ROUTE_PER = 16;   // experts a lane: up to 512
@@ -2206,7 +2277,8 @@ __device__ __forceinline__ float* snap_of(float* snap, size_t stride, unsigned s
 // Three past inputs per channel, then the new one.  A thread is a channel and walks the tokens.  The state as it
 // is after a token of `snaps` goes to snap (snap_of()).
 __global__ void conv4_silu_kernel(const float* __restrict__ x, float* __restrict__ state,
-                                  const float* __restrict__ w, float* __restrict__ out, int channels, int rows,
+                                  const float* __restrict__ w, const float* __restrict__ bias,
+                                  float* __restrict__ out, int channels, int rows,
                                   float* __restrict__ snap, size_t stride, unsigned snaps) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
@@ -2216,7 +2288,8 @@ __global__ void conv4_silu_kernel(const float* __restrict__ x, float* __restrict
     for (int row = 0; row < rows; ++row) {
         const size_t at = size_t(row) * channels + c;
         const float v = x[at];
-        const float y = s0 * wc[0] + s1 * wc[1] + s2 * wc[2] + v * wc[3];
+        float y = s0 * wc[0] + s1 * wc[1] + s2 * wc[2] + v * wc[3];
+        if (bias) y += bias[c];
         s0 = s1;
         s1 = s2;
         s2 = v;
@@ -2241,7 +2314,8 @@ constexpr int CONV_ROWS = 16;
 // first token from the state, the same sum in the same order.  A thread that walked a channel's tokens waited for
 // each token's input in turn: most of the time Qwen3.6's recurrent layers took to read a prompt.
 __global__ void conv4_silu_rows_kernel(const float* __restrict__ x, const float* __restrict__ state,
-                                       const float* __restrict__ w, float* __restrict__ out, int channels) {
+                                       const float* __restrict__ w, const float* __restrict__ bias,
+                                       float* __restrict__ out, int channels) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const int row = blockIdx.y;
@@ -2249,7 +2323,8 @@ __global__ void conv4_silu_rows_kernel(const float* __restrict__ x, const float*
     const float* st = state + size_t(c) * 3;
     auto in = [&](int r) { return r >= 0 ? x[size_t(r) * channels + c] : st[3 + r]; };
     const float s0 = in(row - 3), s1 = in(row - 2), s2 = in(row - 1), v = x[size_t(row) * channels + c];
-    const float y = s0 * wc[0] + s1 * wc[1] + s2 * wc[2] + v * wc[3];
+    float y = s0 * wc[0] + s1 * wc[1] + s2 * wc[2] + v * wc[3];
+    if (bias) y += bias[c];
     out[size_t(row) * channels + c] = y * sigmoid(y);
 }
 
@@ -2988,6 +3063,27 @@ void geglu(const float* gate, const float* up, float* out, int n, void* stream) 
 
 void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream) {
     geglu_rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(gate_up, out, n);
+}
+
+void relu2_rows(const float* x, float* out, int n, int rows, void* stream) {
+    if (rows <= 0 || n <= 0) return;
+    relu2_rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(x, out, n);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("relu2_rows: ") + cudaGetErrorString(e));
+}
+
+void mamba2_step(const float* x, const float* dt, const float* a, const float* b, const float* c,
+                 const float* d, const float* z, const float* norm, float* state, float* out,
+                 int inner, int heads, int groups, int state_dim, int rows, float eps, void* stream) {
+    if (rows <= 0) return;
+    if (state_dim != 128 || inner <= 0 || heads <= 0 || groups <= 0 || inner % heads || heads % groups ||
+        inner / groups <= 0)
+        throw std::invalid_argument("mamba2_step: expected state 128 and divisible inner/head/group counts");
+    mamba2_scan_kernel<<<inner, 128, 0, cs(stream)>>>(x, dt, a, b, c, d, z, state, out,
+                                                      inner, heads, groups, state_dim, rows);
+    mamba2_group_norm_kernel<<<rows * groups, 256, 0, cs(stream)>>>(out, norm, inner / groups, groups, eps);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("mamba2_step: ") + cudaGetErrorString(e));
 }
 
 void route_rows(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale, const float* bias,
@@ -4015,15 +4111,16 @@ void mul_sigmoid(float* acc, const float* g, int n, int rows, int g_stride, bool
 }
 
 void conv4_silu(const float* x, float* state, const float* w, float* out, int channels, int rows, void* stream,
-                float* snap, size_t stride, unsigned snaps) {
+                float* snap, size_t stride, unsigned snaps, const float* bias) {
     if (rows <= 0) return;
     if (rows >= CONV_ROWS && (!snap || !snaps)) {
-        conv4_silu_rows_kernel<<<dim3(grid(channels, 256), rows), 256, 0, cs(stream)>>>(x, state, w, out, channels);
+        conv4_silu_rows_kernel<<<dim3(grid(channels, 256), rows), 256, 0, cs(stream)>>>(x, state, w, bias, out,
+                                                                                        channels);
         conv4_state_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, channels, rows);
         return;
     }
-    conv4_silu_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, w, out, channels, rows, snap, stride,
-                                                                  snaps);
+    conv4_silu_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, w, bias, out, channels, rows, snap,
+                                                                  stride, snaps);
 }
 
 void shortconv(const float* bcx, float* state, const float* w, float* out, int channels, int rows, void* stream,
