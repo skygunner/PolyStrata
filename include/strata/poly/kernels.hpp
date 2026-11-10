@@ -180,6 +180,9 @@ void geglu(const float* gate, const float* up, float* out, int n, void* stream);
 void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream);
 /// out = relu(x)^2, row by row.  Nemotron-H experts have one up projection, not a GLU pair.
 void relu2_rows(const float* x, float* out, int n, int rows, void* stream);
+/// Nemotron's ssm_in parts (z, xBC, dt) gathered from a projection row's stride into tight rows:
+/// dst[row * vals + c] = src[row * stride + c].  `src` is already at the part's offset in the row.
+void gather_rows(const float* src, float* dst, int vals, int rows, int stride, void* stream);
 /// One Mamba-2 selective scan, then its z gate and grouped RMS norm.  state is [inner, state_dim]
 /// (state_dim is 128).  B and C are [rows, groups, state_dim].  Rows run in order, so the state left
 /// is the state after the last row.  norm has inner values.

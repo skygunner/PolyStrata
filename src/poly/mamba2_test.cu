@@ -191,6 +191,69 @@ int main() {
         std::printf("%-42s row at a time vs one call: %.3g\n", r.name, c);
         if (c > r.tol) ++bad;
     }
-    if (bad == 0) std::puts("mamba2_step: GPU recurrence matches the host, and a chunked prompt matches one call");
+
+    {   // gather_rows: a prompt batch's ssm_in parts out of an interleaved projection, value for value
+        const int rows = 37, inner = 8192, xbc = 256, heads = 128, stride = inner + xbc + heads;
+        std::vector<float> src((size_t) rows * stride), want((size_t) rows * inner);
+        for (size_t i = 0; i < src.size(); ++i) src[i] = float(int(i % 23) - 11) / 31.f;
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < inner; ++c) want[(size_t) r * inner + c] = src[(size_t) r * stride + c];
+        float *d_src = nullptr, *d_dst = nullptr;
+        if (cudaMalloc(&d_src, src.size() * 4) != cudaSuccess ||
+            cudaMalloc(&d_dst, want.size() * 4) != cudaSuccess) {
+            std::fprintf(stderr, "FAIL: gather_rows: CUDA allocation\n");
+            return 2;
+        }
+        cudaMemcpy(d_src, src.data(), src.size() * 4, cudaMemcpyHostToDevice);
+        strata::poly::gather_rows(d_src, d_dst, inner, rows, stride, nullptr);
+        std::vector<float> got(want.size());
+        cudaMemcpy(got.data(), d_dst, want.size() * 4, cudaMemcpyDeviceToHost);
+        cudaFree(d_src);
+        cudaFree(d_dst);
+        const float e = worst(got, want);
+        std::printf("%-42s worst abs %.3g\n", "gather_rows 37 rows", e);
+        if (e != 0.f) ++bad;   // a copy: it is right when it is exact
+    }
+    {   // conv4_silu: a batch of rows through the state, one call, against one row a call: the same sums and
+        // the same final state.  A batch that skipped the state update (or mixed the rows' history) shows here.
+        const int channels = 64, rows = 32;
+        std::vector<float> x((size_t) rows * channels), w(4 * channels), bias(channels), state(3 * channels),
+            out((size_t) rows * channels), out_want((size_t) rows * channels), state_after(3 * channels),
+            state_want(3 * channels);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = float(int(i % 13) - 6) / 17.f;
+        for (int c = 0; c < channels; ++c)
+            for (int t = 0; t < 4; ++t) w[(size_t) t * channels + c] = float(int((t + c) % 5) - 2) / 9.f;
+        for (int c = 0; c < channels; ++c) bias[c] = float(int(c % 7) - 3) / 11.f;
+        for (int c = 0; c < 3 * channels; ++c) state[c] = float(int(c % 19) - 9) / 37.f;
+        float *d_x = nullptr, *d_w = nullptr, *d_b = nullptr, *d_s = nullptr, *d_o = nullptr;
+        if (cudaMalloc(&d_x, x.size() * 4) != cudaSuccess || cudaMalloc(&d_w, w.size() * 4) != cudaSuccess ||
+            cudaMalloc(&d_b, bias.size() * 4) != cudaSuccess || cudaMalloc(&d_s, state.size() * 4) != cudaSuccess ||
+            cudaMalloc(&d_o, out.size() * 4) != cudaSuccess) {
+            std::fprintf(stderr, "FAIL: conv4_silu: CUDA allocation\n");
+            return 2;
+        }
+        cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_w, w.data(), w.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_b, bias.data(), bias.size() * 4, cudaMemcpyHostToDevice);
+        // Reference: one row a call, the state advancing row by row.
+        cudaMemcpy(d_s, state.data(), state.size() * 4, cudaMemcpyHostToDevice);
+        for (int r = 0; r < rows; ++r)
+            strata::poly::conv4_silu(d_x + (size_t) r * channels, d_s, d_w, d_o + (size_t) r * channels, channels, 1,
+                                     nullptr, nullptr, 0, 0, d_b);
+        cudaMemcpy(out_want.data(), d_o, out_want.size() * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(state_want.data(), d_s, state_want.size() * 4, cudaMemcpyDeviceToHost);
+        // The batch, from the same state.
+        cudaMemcpy(d_s, state.data(), state.size() * 4, cudaMemcpyHostToDevice);
+        strata::poly::conv4_silu(d_x, d_s, d_w, d_o, channels, rows, nullptr, nullptr, 0, 0, d_b);
+        cudaMemcpy(out.data(), d_o, out.size() * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(state_after.data(), d_s, state_after.size() * 4, cudaMemcpyDeviceToHost);
+        const float e = std::max(worst(out, out_want), worst(state_after, state_want));
+        std::printf("%-42s worst abs %.3g\n", "conv4_silu batch vs a row a call", e);
+        if (e > 1e-4f) ++bad;
+        cudaFree(d_x); cudaFree(d_w); cudaFree(d_b); cudaFree(d_s); cudaFree(d_o);
+    }
+    if (bad == 0)
+        std::puts("mamba2_step: GPU recurrence matches the host, a chunked prompt matches one call, "
+                  "gather_rows copies a projection's parts exactly, and a batch's convolution matches a row a call");
     return bad == 0 ? 0 : 1;
 }

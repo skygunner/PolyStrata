@@ -3072,6 +3072,24 @@ void relu2_rows(const float* x, float* out, int n, int rows, void* stream) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("relu2_rows: ") + cudaGetErrorString(e));
 }
 
+// Nemotron's ssm_in projection lays a token's z, xBC and dt after one another (a row of in_proj_ wide),
+// while the convolution, the scan and the gate each read one part tight.  This gathers one part of a
+// batch of rows: dst[row * vals + c] = src[row * stride + c], `src` already at the part's offset.
+__global__ void gather_rows_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                                   int vals, int stride, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = src[(i / vals) * (int64_t) stride + i % vals];
+}
+
+void gather_rows(const float* src, float* dst, int vals, int rows, int stride, void* stream) {
+    if (rows <= 0 || vals <= 0) return;
+    const int64_t n = (int64_t) rows * vals;
+    gather_rows_kernel<<<grid(size_t(n), 256), 256, 0, cs(stream)>>>(src, dst, vals, stride, n);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("gather_rows: ") + cudaGetErrorString(e));
+}
+
 void mamba2_step(const float* x, const float* dt, const float* a, const float* b, const float* c,
                  const float* d, const float* z, const float* norm, float* state, float* out,
                  int inner, int heads, int groups, int state_dim, int rows, float eps, void* stream) {
@@ -4113,14 +4131,14 @@ void mul_sigmoid(float* acc, const float* g, int n, int rows, int g_stride, bool
 void conv4_silu(const float* x, float* state, const float* w, float* out, int channels, int rows, void* stream,
                 float* snap, size_t stride, unsigned snaps, const float* bias) {
     if (rows <= 0) return;
-    if (rows >= CONV_ROWS && (!snap || !snaps)) {
-        conv4_silu_rows_kernel<<<dim3(grid(channels, 256), rows), 256, 0, cs(stream)>>>(x, state, w, bias, out,
-                                                                                        channels);
-        conv4_state_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, channels, rows);
+    if (rows < CONV_ROWS || (snap && snaps)) {
+        conv4_silu_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, w, bias, out, channels, rows, snap,
+                                                                      stride, snaps);
         return;
     }
-    conv4_silu_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, w, bias, out, channels, rows, snap,
-                                                                  stride, snaps);
+    conv4_silu_rows_kernel<<<dim3(grid(channels, 256), rows), 256, 0, cs(stream)>>>(x, state, w, bias, out,
+                                                                                    channels);
+    conv4_state_kernel<<<grid(channels, 256), 256, 0, cs(stream)>>>(x, state, channels, rows);
 }
 
 void shortconv(const float* bcx, float* state, const float* w, float* out, int channels, int rows, void* stream,

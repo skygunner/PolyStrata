@@ -28,6 +28,9 @@ protected:
     void assign_scratch() override;
     int widest() const override { return in_proj_; }
     int streams() const override { return 1; }
+    /// a prompt batch's rows in one head call: mamba() gathers its parts and the router scores and the
+    /// latent input copy once for the block, where a token a head call would copy each into row 0
+    bool batch_heads() const override { return true; }
     void layer_head(Layer& L, int il, int n) override;
     void layer_tail(Layer& L, int il, int n) override;
     void output_rows(int first, int rows, float* h) override;
@@ -65,6 +68,9 @@ private:
     size_t score_n_ = 0;
 
     float *proj_ = nullptr, *conv_out_ = nullptr, *mamba_out_ = nullptr;
+    float *z_ = nullptr, *conv_in_ = nullptr, *dt_ = nullptr;   ///< a prompt batch's ssm_in parts, tight
+    float *x_ = nullptr;   ///< and the convolution's x out of its interleaved rows, tight for the scan
+    float *b_ = nullptr, *c_ = nullptr;   ///< and its convolution's B and C, tight for the scan
     float *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *att_ = nullptr, *score_ = nullptr, *awork_ = nullptr;
     float *latent_ = nullptr, *shared_ = nullptr;
 };

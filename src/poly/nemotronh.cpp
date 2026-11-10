@@ -124,13 +124,15 @@ void NemotronH::load_geometry() {
         if (expert_ff_[(size_t) il] == 0 && kv_heads_[(size_t) il] > 0)
             need(kv_heads_[(size_t) il] == n_kv_, "attention layers with different head_count_kv");
 
-    // Admission.  The layers' scratch and the expert tables hold one row of tokens, and the SSM state
-    // leaves no snapshot for a guessed window.  Defaults are clamped; explicit incompatible values stop.
-    if (opt_.prompt_batch != 1) {
-        if (opt_.prompt_batch == 1024) opt_.prompt_batch = 1;   // the engine's default, this model's cap
-        else throw std::runtime_error("--prompt-batch " + std::to_string(opt_.prompt_batch) +
-                                      ": nemotron_h_moe runs one prompt token a call (its latent MoE scratch)");
-    }
+    // Admission.  A prompt runs a block of tokens at once: the Mamba layers gather a projection row's
+    // z / xBC / dt tight (and the scan reads the convolution's x gathered tight as well), the scalar F32
+    // projection scales apply once over the whole block, and the convolution and the scan walk a block's
+    // rows in order — the arithmetic of one token a time (poly_conv4_bias_test, poly_mamba2_test; the
+    // all-CPU A/B against a token a call is bit-identical).  Decode stays one token a call: the SSM
+    // state has no snapshot a guessed window could roll back to, and one sequence at a time.
+    if (opt_.prompt_batch < 1 || opt_.prompt_batch > 4096)
+        throw std::runtime_error("--prompt-batch " + std::to_string(opt_.prompt_batch) +
+                                 ": nemotron_h_moe takes 1 to 4096 prompt tokens a call");
     if (opt_.window != 0 && opt_.window != 1)
         throw std::runtime_error("--window " + std::to_string(opt_.window) +
                                  ": nemotron_h_moe decodes one token at a time (no SSM window snapshots)");
@@ -257,6 +259,12 @@ void NemotronH::alloc_caches() {
 void NemotronH::assign_scratch() {
     const size_t n = (size_t) rows_, heads = n * n_head_ * head_dim_, kv = n * n_kv_ * head_dim_;
     proj_ = fbuf(n * in_proj_);
+    z_ = fbuf(n * inner_);
+    x_ = fbuf(n * inner_);
+    conv_in_ = fbuf(n * xbc_);
+    dt_ = fbuf(n * ssm_heads_);
+    b_ = fbuf(n * groups_ * state_dim_);
+    c_ = fbuf(n * groups_ * state_dim_);
     conv_out_ = fbuf(n * xbc_);
     mamba_out_ = fbuf(n * inner_);
     q_ = fbuf(heads); k_ = fbuf(kv); v_ = fbuf(kv); att_ = fbuf(heads);
@@ -301,23 +309,45 @@ void NemotronH::load_card_rows(const uint8_t* src, int64_t from, int64_t count, 
 
 void NemotronH::mamba(Block& B, int n) {
     // The ssm_in projection interleaves z / xBC / dt per token with in_proj_ between rows, while the
-    // convolution and the scan read tight rows.  Admission holds prompt_batch at 1, so every call here is
-    // one token; a batch of more would need strided views (not ported).
-    if (n != 1) throw std::logic_error("nemotron_h_moe Mamba layers run one token a call");
+    // convolution and the scan read each part tight.  One token is tight where it lies; a batch gathers
+    // the three parts.  Snapshots stay one token's (a decode's rollback): a prompt batch commits whole,
+    // and a conversation's checkpoints are at request boundaries.
     lin(B.ssm_in, xn_, proj_, n, xq_);
-    if (B.ssm_in_s.p) scale_rows(proj_, in_proj_, in_proj_, n, nullptr, fp(B.ssm_in_s), false, st_);
-    float* z = proj_;
-    float* xbc = proj_ + inner_;
-    float* dt = proj_ + inner_ + xbc_;
+    // The projection's F32 scale is one value for the whole tensor (scale_of()), so every row of a batch
+    // takes the same factor: scale_rows takes a factor a row, so the rows go through as one wide row.
+    if (B.ssm_in_s.p) scale_rows(proj_, in_proj_, in_proj_ * n, 1, nullptr, fp(B.ssm_in_s), false, st_);
+    const float* z = proj_;
+    const float* xbc = proj_ + inner_;
+    float* dt = proj_ + inner_ + xbc_;   // add_bias adds the dt bias in place
+    if (n > 1) {
+        gather_rows(proj_, z_, inner_, n, in_proj_, st_);
+        gather_rows(xbc, conv_in_, xbc_, n, in_proj_, st_);
+        gather_rows(dt, dt_, ssm_heads_, n, in_proj_, st_);
+        z = z_;
+        xbc = conv_in_;
+        dt = dt_;
+    }
     conv4_silu(xbc, B.conv_state, fp(B.conv), conv_out_, xbc_, n, st_,
-               snap_bits_ ? snap_at_ + (B.conv_state - state_) : nullptr, rec_n_, snap_bits_, fp(B.conv_bias));
+               n == 1 && snap_bits_ ? snap_at_ + (B.conv_state - state_) : nullptr, rec_n_,
+               n == 1 ? snap_bits_ : 0, fp(B.conv_bias));
     add_bias(fp(B.dt_bias), dt, ssm_heads_, n, st_);
+    // The convolution's output interleaves a token's x, B and C (a row of xbc_ wide) while the scan reads
+    // x by inner and B and C each tight; one token is tight where it lies, a batch is gathered.
     const float* b = conv_out_ + inner_;
     const float* c = b + groups_ * state_dim_;
-    mamba2_step(conv_out_, dt, fp(B.a), b, c, fp(B.d), z, fp(B.ssm_norm), B.ssm_state, mamba_out_,
+    const float* xscan = conv_out_;
+    if (n > 1) {
+        gather_rows(conv_out_, x_, inner_, n, xbc_, st_);
+        gather_rows(b, b_, groups_ * state_dim_, n, xbc_, st_);
+        gather_rows(c, c_, groups_ * state_dim_, n, xbc_, st_);
+        xscan = x_;
+        b = b_;
+        c = c_;
+    }
+    mamba2_step(xscan, dt, fp(B.a), b, c, fp(B.d), z, fp(B.ssm_norm), B.ssm_state, mamba_out_,
                 inner_, ssm_heads_, groups_, state_dim_, n, rms_eps_, st_);
     lin(B.wo, mamba_out_, ao_, n);
-    if (B.ssm_out_s.p) scale_rows(ao_, n_embd_, n_embd_, n, nullptr, fp(B.ssm_out_s), false, st_);
+    if (B.ssm_out_s.p) scale_rows(ao_, n_embd_, n_embd_ * n, 1, nullptr, fp(B.ssm_out_s), false, st_);
 }
 
 void NemotronH::attention(Block& B, int64_t pos, int n) {
