@@ -165,8 +165,6 @@ source and binary hashes alongside the prompt IDs and results for each integrati
 - **Metal**: the backend refuses this architecture (see above); it was not built or run.
 - **Other full-model regressions**: GLM and other existing families were not run end to end;
   the full-model regression check covered Qwen3.6.
-- **Expert slots duplicate the single up matrix** (2× that matrix), which reduces cache capacity
-  for a given VRAM reserve. It is a known limitation of the port, not an optimization.
 - **`moe_rows` / `moe_card`** stay GLU-shaped and are disabled for ReLU²/latent layers.
 - **Serial admission only**: `--prompt-batch 1024` is clamped to 1 even when passed explicitly;
   `--prompt-batch 2`, `--window 2` and `--batch 1` are refused before allocation.
@@ -192,8 +190,10 @@ source and binary hashes alongside the prompt IDs and results for each integrati
   by merge or fast-forward; no force-push.
 - Ledger: source SHA `cc72c9f5cec709ad66d881ea28a0de362c573fe3`, source head
   `e59887c1271b07b741669a327fe101102de69647`, upstream base
-  `4de79331b49e553406860470fa3e96b5256e2e50`, common ancestor
-  `dc2080ba16d7f9f644cd01c3d5ff3237b2ae0f85`. Target MIT LICENSE is preserved; attribution to
+  `4de79331b49e553406860470fae96b5256e2e50`, common ancestor
+  `dc2080ba16d7f9f644cd01c3d5ff3237b2ae0f85`. Local work on top: the ReLU² up dedup (`c74aad49`,
+  2026-11-10) went through `bolt-backport-staging`, passed the gates above and was promoted by
+  fast-forward. Target MIT LICENSE is preserved; attribution to
   justlovett0 and the source repository
   (https://github.com/justlovett0/PolyStrata-TeslaM40) stays. Current fork
   https://github.com/skygunner/PolyStrata, upstream https://github.com/simplexai-labs/PolyStrata.
@@ -257,7 +257,8 @@ says so.
   gate and up, `Layer::gu2` sums both, and `fill_expert_cache` copies twice. With equal-size matrices
   the current payload is 50% excess over the ideal up+down; the theoretical reduction of the current
   payload is 1/3, and the theoretical capacity gain for a fixed expert mix is 1.5x, ignoring
-  padding. This is a calculation, not a measured capacity or performance figure.
+  padding. This is a calculation, not a measured capacity or performance figure. Fixed later the same
+  day; the measured numbers are below.
 - 40 MoE layers contain 13,824 actual expert instances:
   `12 * 240 + 6 * 304 + 9 * 368 + 10 * 432 + 3 * 496 = 13,824`.
   The maximum per-layer count, 496, determines the padded expert-table width; 13,824 is the
@@ -292,12 +293,12 @@ startup and short request. The untested backend, Q4 and other-model scopes above
 
 Proposed work only. Nothing here is implemented, and no speed is promised.
 
-- **P0 — deduplicate the ReLU² up matrix.** The engine derives every slot offset from `gu_bytes`,
+- **P0 — deduplicate the ReLU² up matrix. Done 2026-11-10** (measured above: 614 experts at 4096
+  context where 410 fit before, same 0.7 GiB). The engine derives every slot offset from `gu_bytes`,
   `u_bytes` and `gu2()`, and the ReLU² compute reads only the gate half of a slot (the up launch is
-  skipped for ReLU²), so the change is one assignment in `load_nemotron_moe` — store the single up
+  skipped for ReLU²), so the change was one assignment in `load_nemotron_moe` — store the single up
   matrix as the gate and leave the up half empty — plus guards on the copy sites that would move an
-  empty up. The gate and down bytes are unchanged, so a frozen-cache answer should come out
-  bit-identical; measure the actual bytes and experts cached before claiming any capacity gain.
+  empty up.
 - **P1 — native compressed NVFP4 compute.** Most of the math already exists: `vec_dot_nvfp4_q8_1` in
   `src/kernels/cuda/iq_kernels.cu` dots an NVFP4 block with a Q8_1 row on the GPU (written for
   DeepSeek's NVFP4 experts), `native_mmvq.cu` already runs MXFP4 (a four-bit float block) and Q2_0 (a
@@ -324,3 +325,30 @@ Every performance acceptance compares the same GPU, context, prompt token IDs, m
 reserve against a same-day baseline, labels frozen versus dynamic and cold versus warm, and records
 TTFT, prompt and decode rates, GPU and RAM, and cache hits. No speculative percentages are offered
 as promises. The rolling-integration process above is reused rather than a new process or framework.
+
+## P0 measured, 2026-11-10
+
+The up-matrix dedup landed (staging commit `c74aad49`, promoted to `bolt-backport` the same day):
+`load_nemotron_moe` leaves the up half of a ReLU² slot empty (`u_bytes` 0) and the seven copy sites
+skip an empty up; the gate and down bytes are unchanged. Measured on the same card, file and reserve
+as the validation above (4096 context, 512 MiB, 13 threads), against the previous accepted binary
+(SHA-256 `4c4fcc2f…`, run the same day under identical invocations). Raw logs and the A/B driver are
+in `/mnt/storage/PolyStrata-bolt-staging/acceptance-p0/`.
+
+- Load cached **614 of 13,824 experts in 0.7 GiB** (was 410; the arithmetic above said about 406 for
+  the three-matrix slot and 609 after dedup). A 128000-context startup cached **588** (was 392).
+  Warm loads took 7 to 8 s.
+- Greedy A/B, frozen cache, the four recorded raw prompts plus a repeat: five of six answers
+  bit-identical to the old binary; the sixth (raw1) flipped its second token with the larger cache.
+  With the cache shrunk to 408 experts the new binary reproduced the old answer bit for bit, and
+  all-CPU runs (`--vram-reserve-mib 2688`, 0 experts cached) were bit-identical between the
+  binaries: the flip is the GPU/CPU partition moving with the cache — the same class of difference
+  as the probability deltas above, not a change in any expert's math. Each binary reproduced its
+  own output exactly across reruns.
+- The low-RAM pool path (1024 MiB, cache dynamic) answered the recorded prompts bit-identically to
+  the old binary, exercising the pool's up|down layout.
+- Qwen3.6 UD-Q4_K_XL, same day, three of the recorded ten prompts: bit-identical to the old binary.
+- The five GPU tests under compute-sanitizer: 0 errors. The host and CPU-tree tests pass as before.
+- Not redone here: the 3,245-token long prompt, the HTTP loopback suite and the VRAM-resize cycle;
+  the long-context runs at 64K/128K belong to P1's acceptance plan above. HIP was not built (no
+  toolchain on this machine); the change is host-side only.
