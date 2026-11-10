@@ -159,7 +159,9 @@ source and binary hashes alongside the prompt IDs and results for each integrati
   A later startup configured for 128000 tokens and a short request succeeded; this does not
   validate a full 128K context (see the memory audit below).
 - **HIP / SYCL**: no AMD or Intel GPU backend was built or run. The CUDA build is the only one
-  exercised.
+  exercised. The `sycl/` project's build lists no `src/poly` source at all, so `strata-poly` — and this
+  architecture with it — does not exist there; Metal, by contrast, has the poly engine and refuses
+  `nemotron_h_moe` by an explicit factory guard.
 - **Metal**: the backend refuses this architecture (see above); it was not built or run.
 - **Other full-model regressions**: GLM and other existing families were not run end to end;
   the full-model regression check covered Qwen3.6.
@@ -268,6 +270,21 @@ says so.
   alone. The KV cache grows on demand. A 128000-context startup plus a short request is **not** a
   full 128K correctness or stress validation.
 
+- Slot arithmetic checked against the measured caches: from the file's own tensors — IQ2_XXS carries
+  66 bytes per 256 values, the latent width is 1024, per-layer FFN widths run 1536 to 2560, and a slot
+  pads to lcm(66, 8) plus the tail — the average three-matrix slot is 1.765 MiB and all 13,824 slots are
+  23.83 GiB; storing up once gives 1.177 MiB and 15.89 GiB. The measured caches agree with this
+  arithmetic: about 0.7 GiB held 392 to 410 experts, and 0.7 GiB divided by the average slot says
+  about 406.
+- Attention KV is cheap on this file: 8 attention layers of 32 query heads, 2 KV heads and head width
+  128 hold 8 KiB per token, so a full 64K context carries 0.50 GiB of KV and a full 128K carries
+  1.00 GiB. The Mamba state is fixed at 164.7 MiB per sequence. This is arithmetic on the file's
+  shapes, not a measurement.
+- Projection, arithmetic only and to be measured after the work: with the up matrix stored once and
+  the NVFP4 projections kept packed, the cache would start near 6.5 GiB (about 5,900 experts, 43% of
+  13,824), hold about 5.9 GiB (5,300) at a full 64K context and about 5.4 GiB (4,850, 35%) at a full
+  128K — still short of every expert (15.89 GiB after dedup) on a 12 GiB card.
+
 Known gaps are updated accordingly: no full 32K/128K runs exist despite the successful 128000
 startup and short request. The untested backend, Q4 and other-model scopes above still stand.
 
@@ -275,13 +292,26 @@ startup and short request. The untested backend, Q4 and other-model scopes above
 
 Proposed work only. Nothing here is implemented, and no speed is promised.
 
-- **P0 — deduplicate the ReLU² up matrix.** Across all cache, staging, CPU-pool, growth, rekeep and
-  layout paths, keeping heterogeneous dimensions and the existing Qwen regression. Verify layout and
-  behaviour and measure the actual bytes before claiming any cache-capacity gain.
-- **P1 — native compressed NVFP4 compute.** Correct per-tensor `.scale`, an FP32/BF16 reference,
-  kernel parity under memcheck, with the fallback retained and other types unchanged. Benchmark on
-  Ampere; do not assume tensor-core FP4 hardware. Also run actual 32K/128K memory, state and logits
-  validation.
+- **P0 — deduplicate the ReLU² up matrix.** The engine derives every slot offset from `gu_bytes`,
+  `u_bytes` and `gu2()`, and the ReLU² compute reads only the gate half of a slot (the up launch is
+  skipped for ReLU²), so the change is one assignment in `load_nemotron_moe` — store the single up
+  matrix as the gate and leave the up half empty — plus guards on the copy sites that would move an
+  empty up. The gate and down bytes are unchanged, so a frozen-cache answer should come out
+  bit-identical; measure the actual bytes and experts cached before claiming any capacity gain.
+- **P1 — native compressed NVFP4 compute.** Most of the math already exists: `vec_dot_nvfp4_q8_1` in
+  `src/kernels/cuda/iq_kernels.cu` dots an NVFP4 block with a Q8_1 row on the GPU (written for
+  DeepSeek's NVFP4 experts), `native_mmvq.cu` already runs MXFP4 (a four-bit float block) and Q2_0 (a
+  64-value block) through the same small-kernel framework, and `lin()` already dispatches by the
+  tensor's type while `upload` keeps a tensor as the file has it whenever its type is in the supported
+  table. The work is a traits class and a dot overload for the 36-byte block, type 40 in the three
+  dispatch tables, the per-tensor `.scale` (already applied to the projection's result), kernel parity
+  under memcheck against an FP32/BF16 reference, and the BF16 fallback retained. CUDA and HIP compile
+  this one file; the SYCL mirror belongs to a build without the poly engine (Known gaps above), so
+  nothing is owed there. Benchmark on Ampere; do not assume tensor-core FP4 hardware. Run the
+  long-context acceptance at 64K and 128K: startup residency, one prompt of at least 30K tokens with
+  its output and restore checked (the KV-growth path that shrinks the expert cache has never run
+  under a real long context), cold and warm time to first token, decode rate and cache hits, against a
+  same-day baseline.
 - **P2 — batched/chunked Mamba prefill.** Needs numerical state proof and proper ReLU²/latent
   batched kernels; the current GLU-shaped `moe_rows`/`moe_card` stay disabled. A cold-I/O SSD
   comparison only after measurement; no automatic model move.
