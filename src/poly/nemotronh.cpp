@@ -160,13 +160,16 @@ void NemotronH::load_nemotron_moe(Layer& L, Block& B, int il) {
     L.expert_ff = ff;
     L.expert_in = L.expert_out = latent_width_;
     L.gate_inp = mat("ffn_gate_inp.weight", n_embd_, ne);
-    // One up matrix, not a gate/up pair: it is the slot's gate and its up, so gu2() stays the slot layout
-    // the rest of the engine copies (gate | up | down).
+    // One up matrix, not a gate/up pair: it is the slot's gate, and the up half is empty (u_bytes 0), so a
+    // slot is up | down.  Every slot offset comes from gu_bytes / u_bytes / gu2(), which carries the layout
+    // through the cache, staging, swaps and the CPU pool; the sites that copy an up skip an empty one.
+    // u_stride keeps the tensor's own stride for the walkers that guard on exp_up == exp_gate.
     L.gu_type = up->type;
     L.gu_stride = L.gu_bytes = home(*up).payload(*up) / (size_t) ne;
     L.exp_gate = L.exp_up = home(*up).data(*up);
     L.u_type = L.gu_type;
-    L.u_stride = L.u_bytes = L.gu_bytes;
+    L.u_stride = L.gu_stride;
+    L.u_bytes = 0;
     L.gu_step = L.gu2();
     L.d_type = down->type;
     L.d_bytes = home(*down).payload(*down) / (size_t) ne;

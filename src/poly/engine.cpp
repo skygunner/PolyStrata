@@ -1945,7 +1945,7 @@ void Engine::fill_expert_cache() {
         const uint8_t* u_src = L.exp_up + e * L.u_stride;
         const uint8_t* d_src = L.exp_down + e * L.d_bytes;
         h2d(s, g_src, L.gu_bytes);
-        h2d(s + L.gu_bytes, u_src, L.u_bytes);
+        if (L.u_bytes) h2d(s + L.gu_bytes, u_src, L.u_bytes);   // empty for ReLU²: one up matrix
         h2d(s + L.gu2(), d_src, L.d_bytes);
 #if defined(STRATA_GPU_METAL)
         if (opt_.metal_balanced) {
@@ -2270,7 +2270,7 @@ int Engine::grow_cache(size_t bytes, bool later) {
         }
         const size_t e = (size_t) c.e;
         h2d(s, L.exp_gate + e * L.gu_stride, L.gu_bytes);
-        h2d(s + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes);
+        if (L.u_bytes) h2d(s + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes);
         h2d(s + L.gu2(), L.exp_down + e * L.d_bytes, L.d_bytes);
         L.slot[e] = s;
         ++cached_;
@@ -2287,7 +2287,7 @@ void Engine::fill_now() {
         Layer& L = layers_[(size_t) r.il];
         const size_t e = (size_t) r.e;
         h2d(r.slot, L.exp_gate + e * L.gu_stride, L.gu_bytes);
-        h2d(r.slot + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes);
+        if (L.u_bytes) h2d(r.slot + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes);
         h2d(r.slot + L.gu2(), L.exp_down + e * L.d_bytes, L.d_bytes);
         L.slot[e] = r.slot;
         coming_[(size_t) r.il * n_expert_ + e] = 0;
@@ -2344,7 +2344,7 @@ void Engine::follow_loop() {
                 std::memcpy(h, pool_at((size_t) from), gu2 + L.d_bytes);
             } else {
                 get(h, L.exp_gate + e * L.gu_stride, gu);
-                get(h + gu, L.exp_up + e * L.u_stride, L.u_bytes);
+                if (L.u_bytes) get(h + gu, L.exp_up + e * L.u_stride, L.u_bytes);
                 get(h + gu2, L.exp_down + e * L.d_bytes, L.d_bytes);
             }
             err = cudaMemcpyAsync(s->slot, h, gu2 + L.d_bytes, cudaMemcpyHostToDevice, cs(swap_st_));
@@ -3949,7 +3949,7 @@ const uint8_t* Engine::pool_has(int il, int e) const {
 void Engine::pool_read(const Layer& L, PoolRead& r) {
     uint8_t* p = pool_at((size_t) r.s);
     r.ok = read_file(p, L.exp_gate + r.e * L.gu_stride, L.gu_bytes) &&
-           read_file(p + L.gu_bytes, L.exp_up + r.e * L.u_stride, L.u_bytes) &&
+           (L.u_bytes == 0 || read_file(p + L.gu_bytes, L.exp_up + r.e * L.u_stride, L.u_bytes)) &&
            read_file(p + L.gu2(), L.exp_down + r.e * L.d_bytes, L.d_bytes);
 }
 
@@ -4152,7 +4152,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                     if (!r.ok) {
                         uint8_t* p = pool_at(v);
                         std::memcpy(p, L.exp_gate + e * L.gu_stride, L.gu_bytes);
-                        std::memcpy(p + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes);
+                        if (L.u_bytes) std::memcpy(p + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes);
                         std::memcpy(p + L.gu2(), L.exp_down + e * L.d_bytes, L.d_bytes);
                     }
                     pool_state_[v].store(0, std::memory_order_release);
@@ -4262,7 +4262,7 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
                 else if (mapped || !read_file(dst, src, n)) put(dst, src, n);
             };
             if (i % 3 == 0) get(h + j * step, L.exp_gate + e * L.gu_stride, L.gu_bytes, 0);
-            else if (i % 3 == 1) get(h + j * step + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes, L.gu_bytes);
+            else if (i % 3 == 1) { if (L.u_bytes) get(h + j * step + L.gu_bytes, L.exp_up + e * L.u_stride, L.u_bytes, L.gu_bytes); }
             else get(h + c * step + j * L.d_bytes, L.exp_down + e * L.d_bytes, L.d_bytes, L.gu2());
         };
         (alone ? *stagers_ : *workers_).run((int) (3 * c), copy);
