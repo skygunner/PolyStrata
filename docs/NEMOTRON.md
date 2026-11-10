@@ -14,9 +14,10 @@ refused, and only the official pack below has been fed to this port.
   width narrower than the embedding. Two layers of one file may disagree.
 - The tensor types go through the shared dequantizer and CPU-expert paths; the file this code was
   written against is the official IQ2_XXS + NVFP4 pack below, and no other quantization of this
-  architecture has been exercised. NVFP4 `ssm_in` / `ssm_out` are dequantized to BF16 at load and
-  their F32 `.scale` is applied to the projection result, as llama.cpp's
-  `build_lora_mm(..., ssm_in_s)` does. The source supplied the architecture implementation;
+  architecture has been exercised. NVFP4 `ssm_in` / `ssm_out` are computed on the card from the file's
+  own 36-byte blocks (`native_mmvq` type 40, the expression of `vec_dot_nvfp4_q8_1`), with the BF16
+  expansion kept as the fallback, and their F32 `.scale` is applied to the projection result, as
+  llama.cpp's `build_lora_mm(..., ssm_in_s)` does. The source supplied the architecture implementation;
   support for the official checkpoint's NVFP4 projection scales was added during this port.
 
 ## Running it
@@ -133,8 +134,9 @@ Host tests run without a card; the GPU tests below need the CUDA target set and 
 ```sh
 set -e
 cmake --build build-cuda -j4 --target poly_relu2_test poly_conv4_bias_test \
-  poly_mamba2_test poly_nemotron_scale_test poly_route_test
-for test in poly_relu2_test poly_conv4_bias_test poly_mamba2_test poly_nemotron_scale_test poly_route_test
+  poly_mamba2_test poly_nemotron_scale_test poly_route_test poly_nvfp4_mmvq_test
+for test in poly_relu2_test poly_conv4_bias_test poly_mamba2_test poly_nemotron_scale_test poly_route_test \
+  poly_nvfp4_mmvq_test
 do
   compute-sanitizer --tool memcheck --error-exitcode 99 "build-cuda/$test"
 done
@@ -155,9 +157,10 @@ source and binary hashes alongside the prompt IDs and results for each integrati
 ## Known gaps
 
 - **Full Q4** of this architecture: not run; only the official IQ2_XXS + NVFP4 pack was exercised.
-- **Full 32K / 128K context and long prompts**: not run. The measured long request was 3,245 tokens.
-  A later startup configured for 128000 tokens and a short request succeeded; this does not
-  validate a full 128K context (see the memory audit below).
+- **Full 32K / 128K context and long prompts**: a 30,000-token prompt into the 128K context ran
+  correctly on 2026-11-10 (P1 measured below), taking the measured long request from 3,245 to 30K
+  tokens. A context filled to 128K, and the KV-growth path that shrinks the expert cache once KV
+  presses on it, are still unexercised.
 - **HIP / SYCL**: no AMD or Intel GPU backend was built or run. The CUDA build is the only one
   exercised. The `sycl/` project's build lists no `src/poly` source at all, so `strata-poly` — and this
   architecture with it — does not exist there; Metal, by contrast, has the poly engine and refuses
@@ -192,8 +195,9 @@ source and binary hashes alongside the prompt IDs and results for each integrati
   `e59887c1271b07b741669a327fe101102de69647`, upstream base
   `4de79331b49e553406860470fae96b5256e2e50`, common ancestor
   `dc2080ba16d7f9f644cd01c3d5ff3237b2ae0f85`. Local work on top: the ReLU² up dedup (`c74aad49`,
-  2026-11-10) went through `bolt-backport-staging`, passed the gates above and was promoted by
-  fast-forward. Target MIT LICENSE is preserved; attribution to
+  2026-11-10) and the native NVFP4 compute (the same day) each went through `bolt-backport-staging`,
+  passed the gates above and were promoted by fast-forward. Target MIT LICENSE is preserved;
+  attribution to
   justlovett0 and the source repository
   (https://github.com/justlovett0/PolyStrata-TeslaM40) stays. Current fork
   https://github.com/skygunner/PolyStrata, upstream https://github.com/simplexai-labs/PolyStrata.
@@ -223,9 +227,10 @@ is this fork on `bolt-backport`. The local artifacts below are gitignored and ar
   `--port`.
 - `.venv` — a separate Python environment with the repository requirements installed.
 - `engine-poly/strata-poly` — a copy of the validated binary, not a rebuild. After C++ changes
-  rebuild and update the copy; a running binary is not changed by source edits. Since the up-dedup
-  acceptance above (2026-11-10) the copy is the P0 build, SHA-256
-  `943c47a1e7e67606812006828335354d2dc22a28e28cae202605091a46976238`.
+  rebuild and update the copy; a running binary is not changed by source edits. Since the NVFP4
+  acceptance above (2026-11-10) the copy is the P1 build, SHA-256
+  `e2da05d50c3a6cffae6dfb2742e2a0b7d72674891a3e48e0a76bc59d51b9e7ee`
+  (the P0 build before it was `943c47a1…`).
 
 If `polystrata.service` (note the r) is active, the launcher refuses and tells the user to run
 `systemctl --user stop polystrata.service` first and `systemctl --user start polystrata.service`
@@ -247,12 +252,10 @@ says so.
 
 - 80 NVFP4 SSM projections, 40 input + 40 output; 4,383,047,680 elements. Packed on disk the block
   is 36 bytes per 64 elements, so the payload is
-  `4,383,047,680 * 36 / 64 / 2**30 = 2.296142578 GiB`.
-  `Engine::upload` has no native NVFP4 path (type 40 is excluded by
-  `native_mmvq_supported` in `src/kernels/cuda/native_mmvq.cu`) and expands to BF16, 2 bytes per
-  element (128 bytes per 64 elements, an expansion factor of 128/36 = 3.5556): 8.1640625 GiB. The
-  arithmetic difference is 5.867919921875 GiB. That difference is a **theoretical** saving if native
-  compressed computation is implemented; it is not an implemented saving and not a measured speedup.
+  `4,383,047,680 * 36 / 64 / 2**30 = 2.296142578 GiB`. Until 2026-11-10 `Engine::upload` had no
+  native NVFP4 path and expanded them to BF16, 8.1640625 GiB; with type 40 in `native_mmvq` the
+  packed bytes are what the card reads and the 5.867919921875 GiB difference is released (measured
+  below).
 - Other non-expert tensor payload, excluding the token embedding, is about 1.79 GiB. It is an
   estimate that includes tiny F32 CPU biases, so it is not an exact measured GPU allocation.
 - ReLU² experts duplicate the up matrix. `load_nemotron_moe` aliases the same pointer and size for
@@ -301,20 +304,14 @@ Proposed work only. Nothing here is implemented, and no speed is promised.
   skipped for ReLU²), so the change was one assignment in `load_nemotron_moe` — store the single up
   matrix as the gate and leave the up half empty — plus guards on the copy sites that would move an
   empty up.
-- **P1 — native compressed NVFP4 compute.** Most of the math already exists: `vec_dot_nvfp4_q8_1` in
-  `src/kernels/cuda/iq_kernels.cu` dots an NVFP4 block with a Q8_1 row on the GPU (written for
-  DeepSeek's NVFP4 experts), `native_mmvq.cu` already runs MXFP4 (a four-bit float block) and Q2_0 (a
-  64-value block) through the same small-kernel framework, and `lin()` already dispatches by the
-  tensor's type while `upload` keeps a tensor as the file has it whenever its type is in the supported
-  table. The work is a traits class and a dot overload for the 36-byte block, type 40 in the three
-  dispatch tables, the per-tensor `.scale` (already applied to the projection's result), kernel parity
-  under memcheck against an FP32/BF16 reference, and the BF16 fallback retained. CUDA and HIP compile
-  this one file; the SYCL mirror belongs to a build without the poly engine (Known gaps above), so
-  nothing is owed there. Benchmark on Ampere; do not assume tensor-core FP4 hardware. Run the
-  long-context acceptance at 64K and 128K: startup residency, one prompt of at least 30K tokens with
-  its output and restore checked (the KV-growth path that shrinks the expert cache has never run
-  under a real long context), cold and warm time to first token, decode rate and cache hits, against a
-  same-day baseline.
+- **P1 — native compressed NVFP4 compute. Done 2026-11-10** (measured below: 5,806 experts where 614
+  fit before, and 68 against 22 tokens a second at decode). `vec_dot_nvfp4_q8_1` in
+  `src/kernels/cuda/iq_kernels.cu` already dotted an NVFP4 block with a Q8_1 row on the GPU (written
+  for DeepSeek's NVFP4 experts); `native_mmvq.cu` runs the same expression on the Q2_0 kernel's shape
+  (a 64-value block a step) with type 40 in the three dispatch tables, a column at a time so a wider
+  call gives each column the bits its own call gives. The BF16 expansion remains the fallback (and any
+  other backend without the kernel), `lin()` already dispatched by type, CUDA and HIP compile the one
+  file, and the SYCL build has no poly engine to owe (Known gaps).
 - **P2 — batched/chunked Mamba prefill.** Needs numerical state proof and proper ReLU²/latent
   batched kernels; the current GLU-shaped `moe_rows`/`moe_card` stay disabled. A cold-I/O SSD
   comparison only after measurement; no automatic model move.
@@ -354,3 +351,41 @@ in `/mnt/storage/PolyStrata-bolt-staging/acceptance-p0/`.
 - Not redone here: the 3,245-token long prompt, the HTTP loopback suite and the VRAM-resize cycle;
   the long-context runs at 64K/128K belong to P1's acceptance plan above. HIP was not built (no
   toolchain on this machine); the change is host-side only.
+
+## P1 measured, 2026-11-10
+
+Native NVFP4 compute landed (staging, promoted the same day): `native_mmvq.cu` gained `NVFP4Block`,
+`nvfp4_q8_dot` (the `vec_dot_nvfp4_q8_1` expression of `iq_kernels.cu`, the same tables and UE4M3
+decode) and `native_nvfp4_mmvq_kernel` on the Q2_0 kernel's shape, plus type 40 in
+`native_mmvq_supported`, `native_mmvq_weight_bytes` and `native_mmvq`. The engine changes with it:
+`upload` keeps the 36-byte blocks as the file has them (the BF16 expansion stays as any other
+backend's fallback) and `lin()` dispatches them to the new kernel. `poly_nvfp4_mmvq_test`
+(`src/poly/nvfp4_mmvq_test.cu`) checks the kernel against ggml's own dequant of the same blocks and
+the engine's own Q8_1 values: relative error 7.3e-8 over the three shapes (the projections' two
+widths and a small-K one), and a three-column call gives each column the bits its own call gives.
+All measured on the same card, file and settings as above against the P0 build (`943c47a1…`, the
+accepted baseline of the day). Raw logs and the drivers are in
+`/mnt/storage/PolyStrata-bolt-staging/acceptance-p0/` (`ab-tokens-p1.json`, `probs-p0/p1.txt`).
+
+- Startup residency: **5,806 of 13,824 experts (6.6 GiB)** at 4096 context, 5,794 at 64K and 5,780 at
+  128K — against 614 / 588 / 5780's predecessor 392 before P0. The arithmetic above said about 5,900.
+- Greedy A/B against the P0 build, frozen cache, the four recorded raw prompts: **bit-identical on
+  every token**; the teacher-forced top-32 over raw0's eleven steps: top-1 identical 11/11, the
+  largest probability delta on a common token 0.019 (the port's own acceptance band was 0.0213
+  against llama.cpp), minimum top-32 overlap 31/32 (that band: 29/32). The two unfrozen low-RAM
+  prompts: one bit-identical, one diverged at token 2 with the much larger cache — the same
+  partition effect P0's acceptance documented, not a change in any expert's or projection's math.
+- Decode, 64 tokens a run, three runs each, same prompt: **21.95–22.30 tokens/s (P0) against
+  67.7–68.4 (P1)**; prefill of the 5-token prompt 15.2 against 34.7. The expert hit rate rose from
+  26.6% to 67.5% of expert picks, the router wait fell from 35.8 to 8.7 ms/token and the CPU experts
+  from about 8.8 to 4.7 ms/token: the released 5.87 GiB went to experts, and the ssm reads shrank
+  with it.
+- A 30,000-token prompt into the 128K context: prefill at 43.4 tokens/s (12m35s), 96.6% of expert
+  picks from VRAM, 16 tokens answered, no error; its output matched the P0 build's answer to the
+  same prompt token for token (the long-context A/B). The KV-growth path that shrinks the expert
+  cache was still not exercised: 30K of context is 0.23 GiB of KV beside a 6.5 GiB cache.
+- Qwen3.6, same day, three of the recorded prompts: bit-identical to the P0 build (the change is one
+  case in a dispatch the Q4/Q8 files never take).
+- The six GPU tests under compute-sanitizer: 0 errors. HIP was not built (no toolchain here); the
+  dot's only device helpers, `table16_lookup` and `STRATA_DP4A`, are the MXFP4 dot's, which HIP
+  already compiles.
