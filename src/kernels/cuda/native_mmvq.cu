@@ -126,6 +126,12 @@ struct MXFP4Block {
     uint8_t e;
     uint8_t qs[16];
 };
+// NVFP4 (ModelOpt): 4 UE4M3 sub-block scales, then 32 bytes of E2M1 codes — third_party/ggml's block_nvfp4.
+// No alignment either: a run of them has blocks every 36 bytes.
+struct NVFP4Block {
+    uint8_t d[4];
+    uint8_t qs[32];
+};
 static_assert(sizeof(Q5KBlock) == 176 && alignof(Q5KBlock) == 4);
 static_assert(sizeof(Q81Block) == 36 && alignof(Q81Block) == 4);
 static_assert(sizeof(Q20Block) == 18 && alignof(Q20Block) == 2 && offsetof(Q20Block, qs) == 2);
@@ -149,6 +155,7 @@ static_assert(sizeof(Q50Block) == 22 && alignof(Q50Block) == 2 &&
 static_assert(sizeof(Q80Block) == 34 && alignof(Q80Block) == 2 && offsetof(Q80Block, qs) == 2);
 static_assert(sizeof(IQ4NLBlock) == 18 && alignof(IQ4NLBlock) == 2 && offsetof(IQ4NLBlock, qs) == 2);
 static_assert(sizeof(MXFP4Block) == 17 && alignof(MXFP4Block) == 1 && offsetof(MXFP4Block, qs) == 1);
+static_assert(sizeof(NVFP4Block) == 36 && alignof(NVFP4Block) == 1 && offsetof(NVFP4Block, qs) == 4);
 
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
@@ -926,6 +933,77 @@ __device__ __forceinline__ float small_q8_dot(const MXFP4Block* __restrict__ w,
     }
     const float d = mxfp4_scale(w->e) * __low2float(x->ds);
     return d * sumi;
+}
+
+// NVFP4's UE4M3 scale as ggml-cuda's ggml_cuda_ue4m3_to_fp32: kvalues_fp4 holds the E2M1 codes doubled, so
+// the scale comes halved; NaN (0x7F) is 0.  Built from its bits, as iq_kernels.cu builds it, so the GPU and
+// ggml-cpu agree value for value.
+__device__ __forceinline__ float ue4m3_to_f32_half(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint32_t exp = (x >> 3) & 0xF, man = x & 0x7;
+    return exp == 0 ? (float) man * 0.0009765625f
+                    : __uint_as_float(((exp + 119u) << 23) | (man << 20));
+}
+
+// One call = one 32-value half of an NVFP4 block (kqs 0 or 1), the two sub-blocks vec_dot_nvfp4_q8_1 takes
+// per call in iq_kernels.cu (Fmt<40>: step 4): the decode experts' expression, the same tables, so a dot
+// here and a dot there are the same arithmetic on the same bytes.
+__device__ __forceinline__ float nvfp4_q8_dot(const NVFP4Block* __restrict__ w,
+                                              const Q81Block* __restrict__ x, int kqs) {
+    const int iqs = 4 * kqs;   // sub-blocks 0 and 1, or 2 and 3
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int iqs0 = iqs + 2 * i, iqs1 = iqs0 + 1, is = iqs0 >> 1;
+        const int2 v0 = table16_lookup(mxfp4_values, load_int_b2(w->qs, iqs0));
+        const int2 v1 = table16_lookup(mxfp4_values, load_int_b2(w->qs, iqs1));
+        const Q81Block* bq8 = x + (is >> 1);
+        const int i8 = (is & 1) << 2;
+        int sumi = STRATA_DP4A(v0.x, load_int_b2(bq8->qs, i8 + 0), 0);
+        sumi = STRATA_DP4A(v0.y, load_int_b2(bq8->qs, i8 + 2), sumi);
+        sumi = STRATA_DP4A(v1.x, load_int_b2(bq8->qs, i8 + 1), sumi);
+        sumi = STRATA_DP4A(v1.y, load_int_b2(bq8->qs, i8 + 3), sumi);
+        sum += ue4m3_to_f32_half(w->d[is]) * __low2float(bq8->ds) * (float) sumi;
+    }
+    return sum;
+}
+
+// NVFP4's small matvec on native_q2_0_mmvq_kernel's shape (a 64-value block a step): a thread owns the
+// half a block its kqs names, the halves of a row meet in the same cross-warp reduction.
+template<bool SmallK>
+__global__ void native_nvfp4_mmvq_kernel(const NVFP4Block* __restrict__ w,
+                                         const Q81Block* __restrict__ x,
+                                         float* __restrict__ y, int n_in, int n_out) {
+    constexpr int ROWS = SmallK ? WARPS : 1;
+    constexpr int BLOCKS_PER_ITER = WARPS * WARP / 2;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / 64;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / 2; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kby = kbx * 2, kqs = tid % 2;
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += nvfp4_q8_dot(w + block, x + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
 }
 
 // QI=4 for Q4_0/Q5_0/IQ4_NL/MXFP4 and QI=8 for Q8_0. With VDR=2 this preserves
@@ -2858,6 +2936,35 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     launch_check();
 }
 
+// NVFP4, the format of Nemotron's ssm projections: a column a time, the single-column kernel every one of
+// them, so a wider call gives each column the bits its own call gives (the multi-column tables of the other
+// formats are a speedup this one does not need: nemotron_h_moe's serial admission makes one column the only
+// width the engine asks for).
+void native_nvfp4_mmvq(const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, 64);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto* w = static_cast<const NVFP4Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const dim3 threads(WARP, WARPS);
+    for (int c = 0; c < ncols; ++c) {
+        const Q81Block* xc = x + std::size_t(c) * (n_in / 32);
+        float* yc = y + std::size_t(c) * n_out;
+        if (n_in / 64 < WARPS * WARP / 2) {
+            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+            native_nvfp4_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, xc, yc, n_in, n_out);
+        } else {
+            native_nvfp4_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, xc, yc, n_in, n_out);
+        }
+    }
+    launch_check();
+}
+
 void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, 64);
@@ -3139,7 +3246,7 @@ bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 10 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29 || ggml_type == 39;
+           ggml_type == 21 || ggml_type == 22 || ggml_type == 29 || ggml_type == 39 || ggml_type == 40;
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
@@ -3151,6 +3258,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 8: block_elems = 32; block_bytes = 34; break;
     case 20: block_elems = 32; block_bytes = 18; break;
     case 39: block_elems = 32; block_bytes = 17; break;
+    case 40: block_elems = 64; block_bytes = 36; break;
     case 10: block_elems = 256; block_bytes = 84; break;
     case 11: block_elems = 256; block_bytes = 110; break;
     case 12: block_elems = 256; block_bytes = 144; break;
@@ -3180,6 +3288,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 39: small_mmvq<MXFP4Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 40: native_nvfp4_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 10: native_q2_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 12: native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;

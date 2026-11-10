@@ -2224,6 +2224,9 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   target_include_directories(poly_nemotron_scale_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                              ${_strata_gpu_include_directories})
   target_link_libraries(poly_nemotron_scale_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  # Nemotron's NVFP4 projections decoded on the card against a host dequant of the same blocks; a card, by hand
+  add_executable(poly_nvfp4_mmvq_test src/poly/nvfp4_mmvq_test.cu)
+  target_link_libraries(poly_nvfp4_mmvq_test PRIVATE strata_kernels ggml-base CUDA::cudart)
   # DeepSeek V4's kernels against the same arithmetic on the host; needs a card, so it is run by hand
   add_executable(poly_dsv4_test src/poly/dsv4_test.cu src/poly/kernels_dsv4.cu)
   target_include_directories(poly_dsv4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
