@@ -223,7 +223,9 @@ is this fork on `bolt-backport`. The local artifacts below are gitignored and ar
   `--port`.
 - `.venv` — a separate Python environment with the repository requirements installed.
 - `engine-poly/strata-poly` — a copy of the validated binary, not a rebuild. After C++ changes
-  rebuild and update the copy; a running binary is not changed by source edits.
+  rebuild and update the copy; a running binary is not changed by source edits. Since the up-dedup
+  acceptance above (2026-11-10) the copy is the P0 build, SHA-256
+  `943c47a1e7e67606812006828335354d2dc22a28e28cae202605091a46976238`.
 
 If `polystrata.service` (note the r) is active, the launcher refuses and tells the user to run
 `systemctl --user stop polystrata.service` first and `systemctl --user start polystrata.service`
