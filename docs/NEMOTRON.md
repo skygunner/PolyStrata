@@ -29,11 +29,10 @@ strata-poly --model /path/to/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --serve 
 The official file is 22,018,326,528 bytes (22.02 GB / 20.51 GiB). The "24GB" in its name is
 NVIDIA's label, not its measured size.
 
-The initial architecture cap is **one prompt token a call, one decode token, one sequence**.
-`--prompt-batch 1` is supported; the default value 1024 is also accepted and lowered to 1,
-including when explicitly supplied. Other prompt batch sizes, `--window` above 1 and `--batch`
-above 0 are refused. The default window becomes 1 automatically. Mamba state has no per-token
-rollback snapshots, so speculative windows are not supported.
+The architecture takes **one decode token and one sequence a call**; a prompt runs a batch of
+tokens a call (`--prompt-batch 1` to 4096, default 1024). `--window` above 1 and `--batch` above 0
+are refused. The default window becomes 1 automatically. Mamba state has no per-token rollback
+snapshots, so speculative windows are not supported.
 
 Serial continuation, reset and in-memory conversation checkpoints are supported. Disk-session
 `SAVE` and `RESTORE` commands are not implemented by `strata-poly`, for any architecture.
@@ -169,8 +168,9 @@ source and binary hashes alongside the prompt IDs and results for each integrati
 - **Other full-model regressions**: GLM and other existing families were not run end to end;
   the full-model regression check covered Qwen3.6.
 - **`moe_rows` / `moe_card`** stay GLU-shaped and are disabled for ReLU²/latent layers.
-- **Serial admission only**: `--prompt-batch 1024` is clamped to 1 even when passed explicitly;
-  `--prompt-batch 2`, `--window 2` and `--batch 1` are refused before allocation.
+- **Prompt batching is whole blocks, not a pipeline**: a prompt batch's tokens go through a layer
+  as one call (P2 measured below); `--window 2` and `--batch 1` are still refused, and the batched
+  `moe_rows`/`moe_card` paths stay GLU-shaped and unused (the layer's experts run through `moe()`).
 
 ## Rolling integration
 
@@ -312,9 +312,12 @@ Proposed work only. Nothing here is implemented, and no speed is promised.
   call gives each column the bits its own call gives. The BF16 expansion remains the fallback (and any
   other backend without the kernel), `lin()` already dispatched by type, CUDA and HIP compile the one
   file, and the SYCL build has no poly engine to owe (Known gaps).
-- **P2 — batched/chunked Mamba prefill.** Needs numerical state proof and proper ReLU²/latent
-  batched kernels; the current GLU-shaped `moe_rows`/`moe_card` stay disabled. A cold-I/O SSD
-  comparison only after measurement; no automatic model move.
+- **P2 — batched/chunked Mamba prefill. Done 2026-11-10** (measured below: 12,000 tokens read at
+  112.3 against 62.8 tokens a second serial, and the all-CPU A/B bit-identical through prefill and
+  decode). The block goes through `layer_head` once: the ssm_in parts are gathered tight
+  (`gather_rows`), the scalar F32 projection scales apply once over the whole block, the scan reads
+  the convolution's x gathered tight as well, and the convolution and the scan walk the block's rows
+  in order, leaving the state as a token a call would.
 - **P3 — bolt-dev speculation.** Requires a rollback/checkpoint and a draft design; images require an
   encoder, projector and template validated independently. Keep the branch boundary: the accepted
   `bolt-backport` baseline versus experimental `bolt-dev`. PolyStrata upstream first; Strata is a
@@ -368,7 +371,8 @@ accepted baseline of the day). Raw logs and the drivers are in
 `/mnt/storage/PolyStrata-bolt-staging/acceptance-p0/` (`ab-tokens-p1.json`, `probs-p0/p1.txt`).
 
 - Startup residency: **5,806 of 13,824 experts (6.6 GiB)** at 4096 context, 5,794 at 64K and 5,780 at
-  128K — against 614 / 588 / 5780's predecessor 392 before P0. The arithmetic above said about 5,900.
+  128K — against 614 at 4096 and 588 at 128K after P0 (the P0 day ran no 64K startup; before P0, 410 and
+  392). The arithmetic above said about 5,900.
 - Greedy A/B against the P0 build, frozen cache, the four recorded raw prompts: **bit-identical on
   every token**; the teacher-forced top-32 over raw0's eleven steps: top-1 identical 11/11, the
   largest probability delta on a common token 0.019 (the port's own acceptance band was 0.0213
@@ -389,3 +393,43 @@ accepted baseline of the day). Raw logs and the drivers are in
 - The six GPU tests under compute-sanitizer: 0 errors. HIP was not built (no toolchain here); the
   dot's only device helpers, `table16_lookup` and `STRATA_DP4A`, are the MXFP4 dot's, which HIP
   already compiles.
+
+## P2 measured, 2026-11-10
+
+Batched prompt prefill landed (staging): `batch_heads()` is on, a prompt block goes through
+`layer_head` once, and the Mamba layers gather a block's `ssm_in` parts tight (`gather_rows`, new
+kernel), gather the scan's `dt`, `B` and `C` and the convolution's `x` tight out of their interleaved
+rows, and walk the block's rows in order — the arithmetic of one token a call. The scalar F32
+projection scales (`ssm_in.scale`, `ssm_out.scale`, one value a layer) apply to the whole block
+through `scale_rows` with the rows passed as one wide row. Decode stays one token a call, and the
+window stays 1 (the SSM state leaves no snapshot a guessed window could roll back). `--prompt-batch`
+takes 1 to 4096 (default 1024). `moe_rows`/`moe_card` stay GLU-shaped and unused; a batch's experts
+run through `moe()` per row as before. Measured on the same card, file and reserve as above; the
+30,000-token runs went through the serve protocol (the CLI's `--tokens` line does not carry 30K ids),
+the shorter ones through the CLI. Raw drivers and logs in
+`/mnt/storage/PolyStrata-bolt-staging/acceptance-p0/` (`p2_30k_bench.py`, `p2-30k-results.json`,
+`qwen-p2-nogpu.json`, `qwen-pristine-nogpu.json`).
+
+- A 30,000-token prompt into the 128K context, same day, same build, same reserve, the cache within
+  1.4% between the runs (5,717 against 5,636 experts, the VRAM hit rate 91.4% against 91.0% of the
+  expert picks): prefill **59.9 → 106.2 tokens/s (1.77×)**, time to first token 501 s → 282 s;
+  decode 54.6 → 71.9 tokens/s (the block leaves the expert cache fuller). Serial matches P1's
+  recorded 43.4 tokens/s on its own terms (the P1 run carried a smaller cache).
+- The same trend shorter, CLI, `--max-new 1`: 2,048 tokens 65.7 → 114.5 tokens/s; 7,000 tokens
+  42.0 → 97.1; 12,000 tokens 62.8 → 112.3.
+- All-CPU bit-identical A/B (`--no-gpu-experts`, the experts' math has one path): a 5-token, a
+  15-token and a 200-token prompt, each with 8 to 16 decode tokens after, and a 7,000-token prompt's
+  decode — every token identical between `--prompt-batch 1` and 8, prefill and decode.
+- With the experts on the GPU, a block's prefill output is identical too, and a decode can then
+  diverge when the two prompt batches leave different experts in the cache (the 7,000-token prompt's
+  decode flipped at the same token where a serial run with a different cache layout flips) — the
+  same GPU/CPU partition effect P0's acceptance documented, not a change in any expert's math.
+- `poly_mamba2_test` gained the batch cases: `gather_rows` copies a projection's parts exactly, and
+  a 32-row convolution through one call leaves the same output and the same state as one row a call.
+  The three GPU tests under compute-sanitizer: 0 errors. The host tests pass as before.
+- Qwen3.6 UD-Q4_K_XL, same day, all-CPU, the ten recorded prompts: **bit-identical to the pristine
+  base-cuda build** (the engines share `kernels.cu`, where P2 added `gather_rows` and an equivalent
+  re-ordering of `conv4_silu`'s two paths). With the experts on the GPU the two builds diverge on
+  two prompts — the cache-partition effect again, between two runs a process apart.
+- Not redone here: HIP (no toolchain on this machine), and the 128K-full KV-growth path (30K of
+  context is still far from pressing on the cache).
