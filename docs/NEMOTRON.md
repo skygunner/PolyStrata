@@ -155,7 +155,9 @@ source and binary hashes alongside the prompt IDs and results for each integrati
 ## Known gaps
 
 - **Full Q4** of this architecture: not run; only the official IQ2_XXS + NVFP4 pack was exercised.
-- **32K / 128K context and long prompts**: not run. The measured long request was 3,245 tokens.
+- **Full 32K / 128K context and long prompts**: not run. The measured long request was 3,245 tokens.
+  A later startup configured for 128000 tokens and a short request succeeded; this does not
+  validate a full 128K context (see the memory audit below).
 - **HIP / SYCL**: no AMD or Intel GPU backend was built or run. The CUDA build is the only one
   exercised.
 - **Metal**: the backend refuses this architecture (see above); it was not built or run.
@@ -203,3 +205,92 @@ source and binary hashes alongside the prompt IDs and results for each integrati
 - A PolyStrata upstream PR needs the remaining backend builds and review gates first. A native
   Strata port is a separate decision after this backend is established, with measured scheduling
   or prefill benefits to justify adapting its different execution path.
+
+## Local fork operation
+
+`/mnt/ssassd/PolyStrata` stays on `main` as the upstream installation; `/home/vincenty/Projects/PolyStrata`
+is this fork on `bolt-backport`. The local artifacts below are gitignored and are not force-added:
+
+- `run-strata.sh` (executable) — foreground launcher using this fork's `.venv/bin/python`,
+  `serve/server.py` and `engine-poly/strata-poly`. It resolves its own directory, cds to it,
+  runs the server with `--engine strata --config strata-nemotron-bolt-24gb.json --port 8081`,
+  forwards server args after that default, and handles Ctrl-C normally. There is no `--stop`
+  option and it never controls a service.
+- `strata-nemotron-bolt-24gb.json` — host `127.0.0.1` in the JSON; the port is CLI-only
+  (`server.py` default 8095 ignores `cfg.port`) and is set by the launcher, overridable with
+  `--port`.
+- `.venv` — a separate Python environment with the repository requirements installed.
+- `engine-poly/strata-poly` — a copy of the validated binary, not a rebuild. After C++ changes
+  rebuild and update the copy; a running binary is not changed by source edits.
+
+If `polystrata.service` (note the r) is active, the launcher refuses and tells the user to run
+`systemctl --user stop polystrata.service` first and `systemctl --user start polystrata.service`
+after testing. The launcher itself never starts or stops it.
+
+Accepted HTTP run, from `/tmp`: UI 200, health and model identity correct, `STRATA_FREEZE_EXPERTS`
+unset even when inherited as `0`, two-turn chat `READY` then `cobalt` (27 prompt tokens, then 58
+with 29 cached), launcher exit 0, upstream restored afterwards. Evidence:
+`launcher/parent-http-acceptance.json`, `launcher/selfcheck.sh`,
+`launcher/upstream-restored.json`. The first cold request took 87.14 s and the second
+1.63 s; these are two distinct requests, not a throughput benchmark or a speedup claim. The
+validated baseline config is context 4096 / max reply 2048 / `fit_max_tokens` true; later
+128000 / 65536 settings are not the acceptance baseline.
+
+## Memory audit, 2026-11-10
+
+Measured or computed on the official pack; where a number is arithmetic rather than a measurement it
+says so.
+
+- 80 NVFP4 SSM projections, 40 input + 40 output; 4,383,047,680 elements. Packed on disk the block
+  is 36 bytes per 64 elements, so the payload is
+  `4,383,047,680 * 36 / 64 / 2**30 = 2.296142578 GiB`.
+  `Engine::upload` has no native NVFP4 path (type 40 is excluded by
+  `native_mmvq_supported` in `src/kernels/cuda/native_mmvq.cu`) and expands to BF16, 2 bytes per
+  element (128 bytes per 64 elements, an expansion factor of 128/36 = 3.5556): 8.1640625 GiB. The
+  arithmetic difference is 5.867919921875 GiB. That difference is a **theoretical** saving if native
+  compressed computation is implemented; it is not an implemented saving and not a measured speedup.
+- Other non-expert tensor payload, excluding the token embedding, is about 1.79 GiB. It is an
+  estimate that includes tiny F32 CPU biases, so it is not an exact measured GPU allocation.
+- ReLU² experts duplicate the up matrix. `load_nemotron_moe` aliases the same pointer and size for
+  gate and up, `Layer::gu2` sums both, and `fill_expert_cache` copies twice. With equal-size matrices
+  the current payload is 50% excess over the ideal up+down; the theoretical reduction of the current
+  payload is 1/3, and the theoretical capacity gain for a fixed expert mix is 1.5x, ignoring
+  padding. This is a calculation, not a measured capacity or performance figure.
+- 40 MoE layers contain 13,824 actual expert instances:
+  `12 * 240 + 6 * 304 + 9 * 368 + 10 * 432 + 3 * 496 = 13,824`.
+  The maximum per-layer count, 496, determines the padded expert-table width; 13,824 is the
+  actual sum across layers. 392 resident of 13,824 = 2.836% is the resident-capacity fraction,
+  not a cache-hit percentage.
+- Observations: at 4096 context the acceptance run cached 410 of 13,824 experts, about 0.7 GiB; a
+  later 128000-context startup cached 392, about 0.7 GiB, with a 512 MiB reserve and 13 threads. The
+  GPU process sampled at 11,392 MiB with about 490 MiB free in one snapshot. Desktop and driver load
+  are dynamic, so the 18-expert difference between those two runs is not attributed to context
+  alone. The KV cache grows on demand. A 128000-context startup plus a short request is **not** a
+  full 128K correctness or stress validation.
+
+Known gaps are updated accordingly: no full 32K/128K runs exist despite the successful 128000
+startup and short request. The untested backend, Q4 and other-model scopes above still stand.
+
+## Prioritized improvement plan
+
+Proposed work only. Nothing here is implemented, and no speed is promised.
+
+- **P0 — deduplicate the ReLU² up matrix.** Across all cache, staging, CPU-pool, growth, rekeep and
+  layout paths, keeping heterogeneous dimensions and the existing Qwen regression. Verify layout and
+  behaviour and measure the actual bytes before claiming any cache-capacity gain.
+- **P1 — native compressed NVFP4 compute.** Correct per-tensor `.scale`, an FP32/BF16 reference,
+  kernel parity under memcheck, with the fallback retained and other types unchanged. Benchmark on
+  Ampere; do not assume tensor-core FP4 hardware. Also run actual 32K/128K memory, state and logits
+  validation.
+- **P2 — batched/chunked Mamba prefill.** Needs numerical state proof and proper ReLU²/latent
+  batched kernels; the current GLU-shaped `moe_rows`/`moe_card` stay disabled. A cold-I/O SSD
+  comparison only after measurement; no automatic model move.
+- **P3 — bolt-dev speculation.** Requires a rollback/checkpoint and a draft design; images require an
+  encoder, projector and template validated independently. Keep the branch boundary: the accepted
+  `bolt-backport` baseline versus experimental `bolt-dev`. PolyStrata upstream first; Strata is a
+  separate architectural/value assessment, with backend CI gaps stated explicitly.
+
+Every performance acceptance compares the same GPU, context, prompt token IDs, model SHA and
+reserve against a same-day baseline, labels frozen versus dynamic and cold versus warm, and records
+TTFT, prompt and decode rates, GPU and RAM, and cache hits. No speculative percentages are offered
+as promises. The rolling-integration process above is reused rather than a new process or framework.
